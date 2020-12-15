@@ -1,29 +1,21 @@
 use clap::Clap;
 
-use rusoto_core::{Region};
-use rusoto_s3::{
-    S3Client,
-};
+use rusoto_core::Region;
+use rusoto_s3::S3Client;
 
-
-
-
-use std::path::{PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 
-
-
-pub mod error;
 pub mod actions;
-pub mod wal;
+pub mod app;
+pub mod error;
+pub mod result;
 pub mod state;
 pub mod upload;
-pub mod result;
-pub mod app;
+pub mod wal;
 
 use error::Error;
 use result::Result;
-
 
 use app::App;
 
@@ -47,8 +39,8 @@ struct Opts {
     #[clap(short, long)]
     log: PathBuf,
 
-    #[clap(short, long, default_value="3")]
-    retries: u32
+    #[clap(short, long, default_value = "3")]
+    tries: u32,
 }
 
 #[tokio::main]
@@ -61,23 +53,9 @@ async fn main() -> Result<()> {
         .map_err(|err| format!("get region error: {}", err))?;
     let s3client = S3Client::new(region);
 
-    let mut app = App::new(s3client, &opts.bucket, &opts.key, opts.retries, &opts.log).await?;
+    let mut app = App::new(s3client, &opts.bucket, &opts.key, opts.tries, &opts.log, &opts.pattern).await?;
 
-    let mut parts =
-        upload::get_parts(&opts.pattern).map_err(|err| format!("get part files error: {}", err))?;
-
-    for f in parts.iter() {
-        println!("{:?}", f);
-        let filepath = f.into_os_string().into_string()
-            .map_err(|err| format!("error converting path to utf8: {:?}", err))?;
-        let action = actions::Action::AddPart(actions::Part::new(filepath));
-        log.append(wal::WalEntry::new(action.clone())).await?;
-        state.apply(action)?;
-    }
-
-    upload::upload_or_abort(&s3client, parts, &opts.bucket, &opts.key)
-        .await
-        .map_err(|err| format!("upload error: {}", err))?;
+    app.run().await?;
 
     Ok(())
 }

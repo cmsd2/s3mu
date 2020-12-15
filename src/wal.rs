@@ -2,7 +2,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::Path;
-use tokio::fs;
+use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufStream};
 
 pub type Result<T> = std::result::Result<T, WalError>;
@@ -26,11 +26,9 @@ pub struct WalEntry<Action> {
     pub action: Action,
 }
 
-impl <A: Serialize + DeserializeOwned> WalEntry<A> {
+impl<A: Serialize + DeserializeOwned> WalEntry<A> {
     pub fn new(action: A) -> Self {
-        WalEntry {
-            action,
-        }
+        WalEntry { action }
     }
 }
 
@@ -41,7 +39,11 @@ pub struct Wal<Action> {
 
 impl<A: Serialize + DeserializeOwned + 'static> Wal<A> {
     pub async fn open(file_path: &Path) -> Result<Self> {
-        let f = fs::File::open(file_path)
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(file_path)
             .await
             .map_err(|err| WalError::LoadError(format!("error opening log: {}", err)))?;
 
@@ -67,9 +69,11 @@ impl<A: Serialize + DeserializeOwned + 'static> Wal<A> {
     }
 
     pub async fn append(&mut self, entry: WalEntry<A>) -> Result<()> {
-        let line = serde_json::to_string(&entry).map_err(|err| {
+        let mut line = serde_json::to_string(&entry).map_err(|err| {
             WalError::AppendError(format!("error serialising log entry: {}", err))
         })?;
+
+        line += "\n";
 
         self.stream
             .write_all(line.as_bytes())

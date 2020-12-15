@@ -1,10 +1,12 @@
-use serde::{Serialize, Deserialize};
 use crate::state::Part;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Action {
     LoadParts,
-    StartUpload,
+    StartUpload {
+        attempt: u32,
+    },
     Terminate,
     Abort {
         upload_id: String,
@@ -14,6 +16,7 @@ pub enum Action {
     Complete {
         upload_id: String,
         attempt: u32,
+        parts: Vec<Part>,
     },
     UploadPart {
         upload_id: String,

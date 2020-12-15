@@ -1,12 +1,15 @@
-use std::path::{Path, PathBuf};
 use crate::error::Error;
 use crate::result::Result;
+use glob;
+use rusoto_core::ByteStream;
+use rusoto_s3::{
+    AbortMultipartUploadRequest, CompleteMultipartUploadRequest, CompletedMultipartUpload,
+    CompletedPart, CreateMultipartUploadRequest, S3Client, UploadPartRequest, S3,
+};
 use std::cmp;
-use rusoto_core::{ByteStream};
-use rusoto_s3::{S3Client, S3, UploadPartRequest, CompletedPart, CreateMultipartUploadRequest, CompletedMultipartUpload, AbortMultipartUploadRequest, CompleteMultipartUploadRequest};
+use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::{reader_stream, AsyncReadExt, BufReader};
-use glob;
 
 static DEFAULT_BUFFER_SIZE: usize = 1000;
 
@@ -39,7 +42,9 @@ pub async fn start_upload(s3client: &S3Client, bucket: &str, key: &str) -> Resul
         .await
         .map_err(|err| format!("error creating multipart upload request: {}", err))?;
 
-    let upload_id = multipart_upload.upload_id.ok_or_else(|| format!("no upload id returned by create multipart upload request"))?;
+    let upload_id = multipart_upload
+        .upload_id
+        .ok_or_else(|| format!("no upload id returned by create multipart upload request"))?;
 
     Ok(upload_id)
 }
@@ -63,7 +68,12 @@ pub async fn upload_or_abort<V: IntoIterator<Item = PathBuf>>(
     }
 }
 
-pub async fn abort_upload(s3client: &S3Client, bucket: &str, key: &str, upload_id: &str) -> Result<()> {
+pub async fn abort_upload(
+    s3client: &S3Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+) -> Result<()> {
     s3client
         .abort_multipart_upload(AbortMultipartUploadRequest {
             bucket: bucket.to_owned(),
@@ -85,8 +95,14 @@ pub async fn upload<V: IntoIterator<Item = PathBuf>>(
     upload_id: &str,
 ) -> std::result::Result<(), Error> {
     let completed_multipart_upload =
-        upload_parts(&s3client, parts, &bucket, &key, &upload_id).await?;
+        upload_parts(s3client, parts, bucket, key, upload_id).await?;
 
+    complete_upload(s3client, bucket, key, upload_id, completed_multipart_upload).await?;
+
+    Ok(())
+}
+
+pub async fn complete_upload(s3client: &S3Client, bucket: &str, key: &str, upload_id: &str, completed_multipart_upload: CompletedMultipartUpload) -> Result<()> {
     println!("completing upload");
     s3client
         .complete_multipart_upload(CompleteMultipartUploadRequest {
@@ -98,7 +114,7 @@ pub async fn upload<V: IntoIterator<Item = PathBuf>>(
         })
         .await
         .map_err(|err| format!("error completing multipart upload: {}", err))?;
-
+    
     Ok(())
 }
 
@@ -127,13 +143,12 @@ pub async fn upload_parts<V: IntoIterator<Item = PathBuf>>(
 
 pub async fn upload_part(
     s3client: &S3Client,
-    part: &str,
+    part: &Path,
     bucket: &str,
     key: &str,
     upload_id: &str,
     part_number: i64,
 ) -> Result<CompletedPart> {
-    let part = PathBuf::from(part);
     let (len, hash) = digest_file(&part).await?;
     let body = fs::File::open(&part)
         .await

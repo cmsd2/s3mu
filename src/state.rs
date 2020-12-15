@@ -1,5 +1,5 @@
+use serde::{Deserialize, Serialize};
 use std::fmt;
-use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone)]
 pub enum Error {
@@ -17,16 +17,17 @@ impl fmt::Display for Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Part {
+    pub number: i64,
     pub path: String,
     pub etag: String,
 }
 
 impl Part {
-    pub fn new(path: String) -> Self {
+    pub fn new(number: i64, path: String) -> Self {
         Part {
+            number,
             path,
             etag: String::new(),
         }
@@ -38,6 +39,10 @@ pub enum Operation {
     ConfiguredParts(Vec<Part>),
     Started {
         upload_id: String,
+    },
+    FailedStart {
+        attempt: u32,
+        msg: String,
     },
     UploadedPart {
         index: usize,
@@ -60,33 +65,28 @@ pub enum Operation {
     Aborted,
 }
 
+#[derive(Debug, Clone)]
 pub enum State {
     Init,
-    Ready {
+    Starting {
         parts: Vec<Part>,
+        attempt: u32,
     },
-    Started {
-        parts: Vec<Part>,
-        upload_id: String,
-        uploaded: usize,
-    },
-    FailedPart {
+    Uploading {
         parts: Vec<Part>,
         upload_id: String,
         index: usize,
         attempt: u32,
-        msg: String,
     },
-    FailedComplete {
+    Completing {
         upload_id: String,
         attempt: u32,
-        msg: String,
+        parts: Vec<Part>,
     },
     Completed,
-    FailedAbort {
+    Aborting {
         upload_id: String,
         attempt: u32,
-        msg: String,
     },
     Aborted,
 }
@@ -97,84 +97,125 @@ impl State {
     }
 
     pub fn apply(self, op: Operation) -> Result<State> {
+        log::info!("state: {:?}", self);
+        log::info!("op: {:?}", op);
+
         match self {
-            State::Init => {
-                match op {
-                    Operation::ConfiguredParts(parts) => {
-                        Ok(State::Ready {
-                            parts
-                        })
-                    },
-                    op => {
-                        Err(Error::InvalidState(format!("invalid operation {:?} in init state", op)))
+            State::Init => match op {
+                Operation::ConfiguredParts(parts) => {
+                    if parts.is_empty() {
+                        Err(Error::InvalidState(format!("no parts configured")))
+                    } else {
+                        Ok(State::Starting { parts, attempt: 0 })
                     }
-                }
+                },
+                op => Err(Error::InvalidState(format!(
+                    "invalid operation {:?} in init state",
+                    op
+                ))),
             },
-            State::Ready { parts } => {
-                match op {
-                    Operation::Started {
-                        upload_id
-                    } => {
-                        Ok(State::Started {
-                            upload_id,
-                            parts,
-                            uploaded: 0,
-                        })
-                    },
-                    op => {
-                        Err(Error::InvalidState(format!("invalid operation {:?} in ready state", op)))
-                    }
-                }
+            State::Starting { parts, attempt } => match op {
+                Operation::Started { upload_id } => Ok(State::Uploading {
+                    upload_id,
+                    parts,
+                    index: 0,
+                    attempt: 0,
+                }),
+                Operation::FailedStart { attempt, msg } => Ok(State::Starting {
+                    parts,
+                    attempt,
+                }),
+                op => Err(Error::InvalidState(format!(
+                    "invalid operation {:?} in ready state",
+                    op
+                ))),
             },
-            State::Started { mut parts, upload_id, uploaded } => {
-                match op {
-                    Operation::UploadedPart {index, etag} => {
-                        parts.get_mut(index).ok_or_else(|| Error::IndexOutOfBounds)?.etag = etag;
-                        Ok(State::Started {
+            State::Uploading {
+                mut parts,
+                upload_id,
+                index,
+                attempt,
+            } => match op {
+                Operation::UploadedPart { mut index, etag } => {
+                    parts
+                        .get_mut(index)
+                        .ok_or_else(|| Error::IndexOutOfBounds)?
+                        .etag = etag;
+                    
+                    index += 1;
+
+                    if index == parts.len() {
+                        Ok(State::Completing {
                             upload_id,
-                            uploaded: index + 1,
+                            attempt: 0,
                             parts,
                         })
-                    },
-                    Operation::FailedPart {index,attempt,msg} => {
-                        Ok(State::FailedPart {
+                    } else {
+                        Ok(State::Uploading {
                             upload_id,
                             index,
                             parts,
-                            attempt,
-                            msg,
+                            attempt: 0,
                         })
-                    },
-                    Operation::Aborted => {
-                        Ok(State::Aborted)
-                    },
-                    Operation::Completed => {
-                        Ok(State::Completed)
-                    },
-                    Operation::FailedAbort {
-                        msg,
-                        attempt,
-                    } => {
-                        Ok(State::FailedAbort {
-                            attempt,
-                            msg,
-                            upload_id,
-                        })
-                    },
-                    Operation::FailedComplete {
-                        attempt,
-                        msg,
-                    } => {
-                        Ok(State::FailedComplete {
-                            upload_id,
-                            attempt,
-                            msg,
-                        })
-                    },
-                    op => {
-                        Err(Error::InvalidState(format!("invalid operation {:?} in started state", op)))
                     }
                 }
+                Operation::FailedPart {
+                    index,
+                    attempt,
+                    msg,
+                } => Ok(State::Uploading {
+                    upload_id,
+                    index,
+                    parts,
+                    attempt: attempt + 1,
+                }),
+                op => Err(Error::InvalidState(format!(
+                    "invalid operation {:?} in uploading state",
+                    op
+                ))),
+            },
+            State::Completing {
+                upload_id,
+                attempt,
+                parts,
+            } => match op {
+                Operation::Completed => Ok(State::Completed),
+                Operation::FailedComplete { attempt, msg } => Ok(State::Completing {
+                    upload_id: upload_id.to_owned(),
+                    attempt: attempt + 1,
+                    parts,
+                }),
+                Operation::Aborted => Ok(State::Aborted),
+                op => Err(Error::InvalidState(format!(
+                    "invalid operation {:?} in completing state",
+                    op
+                ))),
+            },
+            State::Aborting {
+                ref upload_id,
+                attempt,
+            } => match op {
+                Operation::Aborted => Ok(State::Aborted),
+                Operation::FailedAbort { msg, attempt } => Ok(State::Aborting {
+                    attempt: attempt + 1,
+                    upload_id: upload_id.to_owned(),
+                }),
+                op => Err(Error::InvalidState(format!(
+                    "invalid operation {:?} in aborting state",
+                    op
+                ))),
+            },
+            State::Completed => match op {
+                op => Err(Error::InvalidState(format!(
+                    "invalid operation {:?} in completed state",
+                    op
+                ))),
+            },
+            State::Aborted => match op {
+                op => Err(Error::InvalidState(format!(
+                    "invalid operation {:?} in aborted state",
+                    op
+                ))),
             }
         }
     }

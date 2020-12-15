@@ -1,12 +1,11 @@
-
-use std::path::Path;
-use std::mem;
-use rusoto_s3::S3Client;
 use crate::actions::*;
-use crate::wal::*;
-use crate::state::*;
 use crate::result::Result;
+use crate::state::*;
 use crate::upload;
+use crate::wal::*;
+use rusoto_s3::S3Client;
+use std::mem;
+use std::path::{Path, PathBuf};
 
 pub struct App {
     pub s3client: S3Client,
@@ -15,10 +14,18 @@ pub struct App {
     pub max_attempts: u32,
     pub log: Wal<Operation>,
     pub state: State,
+    pub pattern: String,
 }
 
 impl App {
-    pub async fn new(s3client: S3Client, bucket: &str, key: &str, max_attempts: u32, log_file: &Path) -> Result<Self> {
+    pub async fn new(
+        s3client: S3Client,
+        bucket: &str,
+        key: &str,
+        max_attempts: u32,
+        log_file: &Path,
+        pattern: &str,
+    ) -> Result<Self> {
         let log: Wal<Operation> = Wal::open(log_file).await?;
         let mut state = State::new();
 
@@ -33,6 +40,7 @@ impl App {
             max_attempts,
             log,
             state,
+            pattern: pattern.to_owned(),
         })
     }
 
@@ -50,97 +58,97 @@ impl App {
 
     pub fn next_action(&self) -> Action {
         match self.state {
-            State::Init => {
-                Action::LoadParts
-            },
-            State::Ready { ref parts} => {
-                Action::StartUpload
-            },
-            State::Started { ref parts, ref upload_id, uploaded} => {
-                if count == parts.len() {
-                    Action::Complete {
-                        upload_id: upload_id.to_owned(),
-                        attempt: 1,
-                    }
-                } else if count > parts.len() {
-                    Action::Abort {
-                        msg: format!("more parts uploaded than configured"),
-                        upload_id: upload_id.to_owned(),
-                        attempt: 1,
-                    }
+            State::Init => Action::LoadParts,
+            State::Starting { ref parts, attempt } => {
+                if attempt == self.max_attempts {
+                    Action::Terminate
                 } else {
-                    Action::UploadPart {
-                        upload_id: upload_id.to_owned(),
-                        index: count,
-                        attempt: 1,
-                        part: parts.get(uploaded).unwrap().to_owned(),
+                    Action::StartUpload {
+                        attempt: attempt,
                     }
                 }
             },
-            State::FailedPart { ref parts, ref upload_id, index, attempt, ref msg } => {
-                println!("error uploading part {} on attempt {} of {}: {}", index + 1, attempt, self.max_attempts, msg);
+            State::Uploading {
+                ref parts,
+                ref upload_id,
+                index,
+                attempt,
+            } => {
+                log::info!(
+                    "uploading part {} attempt {} of {}",
+                    index + 1,
+                    attempt,
+                    self.max_attempts,
+                );
                 if attempt == self.max_attempts {
                     Action::Abort {
                         upload_id: upload_id.to_owned(),
-                        msg: format!("{} out of {} failures uploading part {}: {}", attempt, self.max_attempts, index + 1, msg),
-                        attempt: 1,
-                    }
-                } else if index >= parts.len() {
-                    Action::Abort {
-                        upload_id: upload_id.to_owned(),
-                        msg: format!("invalid part index {}", index),
+                        msg: format!(
+                            "{} out of {} failures uploading part {}",
+                            attempt,
+                            self.max_attempts,
+                            index + 1,
+                        ),
                         attempt: 1,
                     }
                 } else {
                     Action::UploadPart {
                         upload_id: upload_id.to_owned(),
                         index,
-                        attempt: attempt + 1,
+                        attempt: attempt,
                         part: parts.get(index).unwrap().to_owned(),
                     }
                 }
-            },
-            State::FailedComplete {
+            }
+            State::Completing {
                 attempt,
                 ref upload_id,
-                ref msg
+                ref parts,
             } => {
-                println!("error completing upload on attempt {} of {}: {}", attempt, self.max_attempts, msg);
+                log::info!(
+                    "completing upload attempt {} of {}",
+                    attempt, self.max_attempts
+                );
                 if attempt == self.max_attempts {
                     Action::Abort {
                         upload_id: upload_id.to_owned(),
-                        msg: format!("{} out of {} failures completing upload: {}", attempt, self.max_attempts, msg),
+                        msg: format!(
+                            "{} out of {} failures completing upload",
+                            attempt, self.max_attempts
+                        ),
                         attempt: 1,
                     }
                 } else {
                     Action::Complete {
                         upload_id: upload_id.to_owned(),
-                        attempt: attempt + 1,
+                        attempt: attempt,
+                        parts: parts.to_owned(),
                     }
                 }
-            },
-            State::Completed => {
-                Action::Terminate
-            },
-            State::FailedAbort {
+            }
+            State::Completed => Action::Terminate,
+            State::Aborting {
                 ref upload_id,
                 attempt,
-                ref msg
             } => {
-                println!("error aborting upload on attempt {} of {}: {}", attempt, self.max_attempts, msg);
+                log::info!(
+                    "aborting upload attempt {} of {}",
+                    attempt, self.max_attempts
+                );
                 if attempt == self.max_attempts {
                     Action::Terminate
                 } else {
                     Action::Abort {
                         upload_id: upload_id.to_owned(),
-                        msg: format!("{} out of {} failures completing upload: {}", attempt, self.max_attempts, msg),
-                        attempt: attempt + 1,
+                        msg: format!(
+                            "{} out of {} failures completing upload",
+                            attempt, self.max_attempts
+                        ),
+                        attempt: attempt,
                     }
                 }
-            },
-            State::Aborted => {
-                Action::Terminate
-            },
+            }
+            State::Aborted => Action::Terminate,
         }
     }
 
@@ -148,9 +156,21 @@ impl App {
         loop {
             let next_action = self.next_action();
 
+            log::info!("action: {:?}", next_action);
+
             let op = match next_action {
                 Action::Terminate => {
                     break;
+                },
+                Action::LoadParts => {
+                    let mut parts = vec![];
+                    let paths = upload::get_parts(&self.pattern).map_err(|err| format!("get part files error: {}", err))?;
+                    let mut i = 1;
+                    for path in paths {
+                        parts.push(Part::new(i, path.to_str().ok_or_else(|| format!("error handling non utf8 path"))?.to_owned()));
+                        i += 1;
+                    }
+                    Operation::ConfiguredParts(parts)
                 },
                 Action::UploadPart {
                     ref upload_id,
@@ -160,20 +180,27 @@ impl App {
                 } => {
                     let part_number = (index + 1) as i64;
 
-                    match upload::upload_part(&self.s3client, &part.path, &self.bucket, &self.key, upload_id, part_number).await {
-                        Ok(completed_part) => {
-                            Operation::UploadedPart {
-                                index,
-                                etag: completed_part.e_tag,
-                            }
+                    match upload::upload_part(
+                        &self.s3client,
+                        &PathBuf::from(&part.path),
+                        &self.bucket,
+                        &self.key,
+                        upload_id,
+                        part_number,
+                    )
+                    .await
+                    .map_err(|err| format!("upload part error: {:?}", err))
+                    .and_then(|part| part.e_tag.ok_or_else(|| format!("missing etag in uploaded part")))
+                    {
+                        Ok(etag) => Operation::UploadedPart {
+                            index,
+                            etag: etag,
                         },
-                        Err(err) => {
-                            Operation::FailedPart {
-                                index,
-                                attempt,
-                                msg: format!("{:?}", err),
-                            }
-                        }
+                        Err(err) => Operation::FailedPart {
+                            index,
+                            attempt,
+                            msg: format!("{:?}", err),
+                        },
                     }
                 },
                 Action::Abort {
@@ -181,21 +208,52 @@ impl App {
                     attempt,
                     ref msg,
                 } => {
-                    match upload::abort_upload(&self.s3client, &self.bucket, &self.key, upload_id).await {
-                        Ok(()) => {
-                            Operation::Aborted
+                    match upload::abort_upload(&self.s3client, &self.bucket, &self.key, upload_id)
+                        .await
+                    {
+                        Ok(()) => Operation::Aborted,
+                        Err(err) => Operation::FailedAbort {
+                            msg: format!("error aborting upload: {}", err),
+                            attempt,
+                        },
+                    }
+                },
+                Action::StartUpload {
+                    attempt,
+                } => {
+                    match upload::start_upload(&self.s3client, &self.bucket, &self.key).await {
+                        Ok(upload_id) => {
+                            Operation::Started {
+                                upload_id,
+                            }
                         },
                         Err(err) => {
-                            Operation::FailedAbort {
-                                msg: format!("error aborting upload: {}", err),
-                                attempt,
+                            Operation::FailedStart {
+                                attempt: attempt,
+                                msg: format!("error starting upload: {}", err),
                             }
                         }
                     }
                 },
-                Action::StartUpload => {
-                    match upload::start_upload(&self.s3client, &self.bucket, &self.key).await {
-
+                Action::Complete {
+                    ref upload_id,
+                    attempt,
+                    ref parts,
+                } => {
+                    let completed_upload = rusoto_s3::CompletedMultipartUpload {
+                        parts: Some(parts.iter().map(|part| rusoto_s3::CompletedPart {
+                            e_tag: Some(part.etag.to_owned()),
+                            part_number: Some(part.number),
+                        }).collect()),
+                    };
+                    match upload::complete_upload(&self.s3client, &self.bucket, &self.key, upload_id, completed_upload)
+                        .await
+                    {
+                        Ok(()) => Operation::Completed,
+                        Err(err) => Operation::FailedComplete {
+                            msg: format!("error aborting upload: {}", err),
+                            attempt,
+                        },
                     }
                 }
             };
